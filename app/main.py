@@ -1,7 +1,14 @@
-from fastapi import FastAPI, Query, HTTPException
+import logging
+import time
+from contextlib import suppress
 
-from app.tv_fetch import fetch_bars
-from app.db import save_ohlcv, load_ohlcv, delete_latest_bar, get_bar_count
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from app.db import delete_latest_bar, get_bar_count, load_ohlcv, save_ohlcv
+from app.tv_fetch import TradingViewError, fetch_bars
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Prices Service")
 
@@ -10,67 +17,199 @@ VALID_TIMEFRAMES = {"1", "5", "15", "30", "1H", "1D", "1W", "1M"}
 # TradingView uses "60" for 1H
 TV_TIMEFRAME_MAP = {"1H": "60"}
 
+_START_TIME = time.time()
+_BATCH_FETCH_DELAY_SECONDS = 0.5
+
+
+class BatchBarsRequest(BaseModel):
+    symbols: list[str] = Field(..., min_length=1, description="List of symbols in EXCHANGE:SYMBOL format")
+    timeframe: str = Field("1D", description="Timeframe: 1, 5, 15, 30, 1H, 1D, 1W, 1M")
+    bars: int = Field(5000, ge=2, le=5000, description="Max number of bars to fetch per symbol")
+
+
+def _bar_from_row(row: list[float]) -> dict:
+    return {
+        "timestamp": int(row[0]),
+        "open": row[1],
+        "high": row[2],
+        "low": row[3],
+        "close": row[4],
+        "volume": row[5],
+    }
+
+
+@app.get("/healthz")
+def healthz():
+    db_ok = True
+    db_error = None
+
+    try:
+        get_bar_count("__healthcheck__", "1D")
+    except Exception as exc:
+        db_ok = False
+        db_error = str(exc)
+
+    return {
+        "status": "ok" if db_ok else "degraded",
+        "db_ok": db_ok,
+        "db_error": db_error,
+        "uptime_seconds": round(time.time() - _START_TIME, 2),
+    }
+
+
+def _validate_timeframe(timeframe: str) -> str:
+    if timeframe not in VALID_TIMEFRAMES:
+        raise HTTPException(400, f"Invalid timeframe. Valid: {sorted(VALID_TIMEFRAMES)}")
+    return TV_TIMEFRAME_MAP.get(timeframe, timeframe)
+
+
+def _build_stale_payload(symbol: str, timeframe: str, bars: int, warning: str) -> dict | None:
+    try:
+        cached_bars = load_ohlcv(symbol, timeframe)
+    except Exception:
+        logger.exception("Failed to load cached bars for stale fallback %s %s", symbol, timeframe)
+        return None
+
+    if not cached_bars:
+        return None
+
+    if len(cached_bars) > bars:
+        cached_bars = cached_bars[-bars:]
+
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "count": len(cached_bars),
+        "bars": cached_bars,
+        "stale": True,
+        "warning": warning,
+    }
+
+
+def _get_bars_payload(symbol: str, timeframe: str, bars: int) -> dict:
+    tv_freq = _validate_timeframe(timeframe)
+
+    try:
+        with suppress(Exception):
+            delete_latest_bar(symbol, timeframe)
+
+        cached_count = get_bar_count(symbol, timeframe)
+        all_bars = load_ohlcv(symbol, timeframe)
+
+        try:
+            if cached_count < bars - 1:
+                data = fetch_bars(symbol, tv_freq, bars=bars)
+                if not data:
+                    raise TradingViewError("No data received from TradingView")
+
+                if len(data) > 1:
+                    save_ohlcv(symbol, timeframe, data[:-1])
+                    all_bars = load_ohlcv(symbol, timeframe)
+
+                all_bars.append(_bar_from_row(data[-1]))
+            else:
+                data = fetch_bars(symbol, tv_freq, bars=min(10, bars))
+                if data:
+                    if len(data) > 1:
+                        save_ohlcv(symbol, timeframe, data[:-1])
+                        all_bars = load_ohlcv(symbol, timeframe)
+                    all_bars.append(_bar_from_row(data[-1]))
+        except (TradingViewError, HTTPException) as exc:
+            warning = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            logger.warning("TradingView fetch failed for %s %s: %s", symbol, timeframe, warning)
+            stale_payload = _build_stale_payload(symbol, timeframe, bars, warning)
+            if stale_payload is not None:
+                return stale_payload
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(502, warning) from exc
+
+        if len(all_bars) > bars:
+            all_bars = all_bars[-bars:]
+
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "count": len(all_bars),
+            "bars": all_bars,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unexpected prices-service failure for %s %s", symbol, timeframe)
+        raise HTTPException(500, f"Internal prices-service error: {exc}") from exc
 
 
 @app.get("/bars")
 def get_bars(
     symbol: str = Query(..., description="Symbol in EXCHANGE:SYMBOL format, e.g. NASDAQ:AAPL"),
     timeframe: str = Query("1D", description="Timeframe: 1, 5, 15, 30, 60, 1D, 1W, 1M"),
-    bars: int = Query(5000, description="Max number of bars to fetch"),
+    bars: int = Query(5000, ge=2, le=5000, description="Max number of bars to fetch"),
 ):
-    if timeframe not in VALID_TIMEFRAMES:
-        raise HTTPException(400, f"Invalid timeframe. Valid: {sorted(VALID_TIMEFRAMES)}")
+    return _get_bars_payload(symbol=symbol, timeframe=timeframe, bars=bars)
 
-    tv_freq = TV_TIMEFRAME_MAP.get(timeframe, timeframe)
 
-    # Evict the last cached bar (it was potentially incomplete)
-    delete_latest_bar(symbol, timeframe)
+@app.get("/bars/batch")
+def get_bars_batch(
+    symbols: str = Query(..., description="Comma-separated symbols, e.g. NASDAQ:BMRN,NYSE:NVO"),
+    timeframe: str = Query("1D", description="Timeframe: 1, 5, 15, 30, 1H, 1D, 1W, 1M"),
+    bars: int = Query(5000, ge=2, le=5000, description="Max number of bars to fetch per symbol"),
+):
+    parsed_symbols = [symbol.strip() for symbol in symbols.split(",") if symbol.strip()]
+    if not parsed_symbols:
+        raise HTTPException(400, "At least one symbol is required")
+    return _get_bars_batch_payload(parsed_symbols, timeframe, bars)
 
-    cached_count = get_bar_count(symbol, timeframe)
 
-    if cached_count < bars - 1:
-        # Not enough cached data — fetch from TradingView
-        data = fetch_bars(symbol, tv_freq, bars=bars)
-        if not data:
-            raise HTTPException(502, "No data received from TradingView")
+@app.post("/bars/batch")
+def post_bars_batch(request: BatchBarsRequest):
+    return _get_bars_batch_payload(request.symbols, request.timeframe, request.bars)
 
-        # Cache everything except the last bar (incomplete candle)
-        if len(data) > 1:
-            save_ohlcv(symbol, timeframe, data[:-1])
 
-        # Return all bars including the last incomplete one
-        all_bars = load_ohlcv(symbol, timeframe)
-        last_row = data[-1]
-        all_bars.append({
-            "timestamp": int(last_row[0]),
-            "open": last_row[1],
-            "high": last_row[2],
-            "low": last_row[3],
-            "close": last_row[4],
-            "volume": last_row[5],
-        })
-    else:
-        # Enough cached data — just fetch latest from TV to get the current incomplete bar
-        data = fetch_bars(symbol, tv_freq, bars=10)
-        all_bars = load_ohlcv(symbol, timeframe)
-        if data:
-            # Save all fetched bars except the last (incomplete) to update recent completed bars
-            if len(data) > 1:
-                save_ohlcv(symbol, timeframe, data[:-1])
-                all_bars = load_ohlcv(symbol, timeframe)
-            last_row = data[-1]
-            all_bars.append({
-                "timestamp": int(last_row[0]),
-                "open": last_row[1],
-                "high": last_row[2],
-                "low": last_row[3],
-                "close": last_row[4],
-                "volume": last_row[5],
-            })
+def _get_bars_batch_payload(symbols: list[str], timeframe: str, bars: int) -> dict:
+    _validate_timeframe(timeframe)
 
+    normalized_symbols = [symbol.strip() for symbol in symbols if symbol and symbol.strip()]
+    if not normalized_symbols:
+        raise HTTPException(400, "At least one symbol is required")
+
+    results = []
+    succeeded = 0
+
+    for index, symbol in enumerate(normalized_symbols):
+        try:
+            payload = _get_bars_payload(symbol=symbol, timeframe=timeframe, bars=bars)
+            payload["status"] = "ok"
+            results.append(payload)
+            succeeded += 1
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            results.append(
+                {
+                    "symbol": symbol,
+                    "status": "error",
+                    "error": detail,
+                    "http_status": exc.status_code,
+                }
+            )
+        except Exception as exc:
+            logger.exception("Unexpected batch failure for %s %s", symbol, timeframe)
+            results.append(
+                {
+                    "symbol": symbol,
+                    "status": "error",
+                    "error": f"Internal prices-service error: {exc}",
+                    "http_status": 500,
+                }
+            )
+
+        if index < len(normalized_symbols) - 1:
+            time.sleep(_BATCH_FETCH_DELAY_SECONDS)
+
+    failed = len(results) - succeeded
     return {
-        "symbol": symbol,
-        "timeframe": timeframe,
-        "count": len(all_bars),
-        "bars": all_bars,
+        "results": results,
+        "total": len(normalized_symbols),
+        "succeeded": succeeded,
+        "failed": failed,
     }

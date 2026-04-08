@@ -1,12 +1,16 @@
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "data" / "prices.db"
+BASE_DIR = Path(__file__).resolve().parent.parent
+DB_PATH = BASE_DIR / "data" / "prices.db"
 
 
 def get_connection():
-    DB_PATH.parent.mkdir(exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
 
 
 def init_db():
@@ -29,15 +33,40 @@ def init_db():
         )
 
 
+def _normalize_rows(data: list) -> list[tuple]:
+    normalized = []
+    for row in data:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            continue
+        try:
+            normalized.append(
+                (
+                    int(row[0]),
+                    float(row[1]),
+                    float(row[2]),
+                    float(row[3]),
+                    float(row[4]),
+                    float(row[5]) if row[5] is not None else None,
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return normalized
+
+
 def save_ohlcv(symbol: str, timeframe: str, data: list):
     """Save OHLCV rows. data = list of [timestamp, open, high, low, close, volume]."""
     init_db()
+    normalized = _normalize_rows(data)
+    if not normalized:
+        return
+
     with get_connection() as conn:
         conn.executemany(
             "INSERT OR REPLACE INTO ohlcv VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                (symbol, timeframe, int(row[0]), row[1], row[2], row[3], row[4], row[5])
-                for row in data
+                (symbol, timeframe, ts, open_, high, low, close, volume)
+                for ts, open_, high, low, close, volume in normalized
             ],
         )
 

@@ -65,7 +65,7 @@ curl "http://localhost:9999/bars?symbol=NASDAQ:AAPL&timeframe=1D&bars=100"
 
 ## launchd
 
-A launch agent is installed at `~/Library/LaunchAgents/com.alun.prices-service.plist`. It does not start automatically on login.
+A launch agent is installed at `~/Library/LaunchAgents/com.alun.prices-service.plist`. It starts automatically on login.
 
 **Start:**
 ```
