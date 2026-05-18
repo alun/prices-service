@@ -33,6 +33,12 @@ def init_db():
         )
 
 
+def db_ping():
+    """Cheap connectivity check; raises on failure."""
+    with get_connection() as conn:
+        conn.execute("SELECT 1").fetchone()
+
+
 def _normalize_rows(data: list) -> list[tuple]:
     normalized = []
     for row in data:
@@ -56,7 +62,6 @@ def _normalize_rows(data: list) -> list[tuple]:
 
 def save_ohlcv(symbol: str, timeframe: str, data: list):
     """Save OHLCV rows. data = list of [timestamp, open, high, low, close, volume]."""
-    init_db()
     normalized = _normalize_rows(data)
     if not normalized:
         return
@@ -73,7 +78,6 @@ def save_ohlcv(symbol: str, timeframe: str, data: list):
 
 def load_ohlcv(symbol: str, timeframe: str) -> list[dict]:
     """Load all cached bars as list of dicts."""
-    init_db()
     with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -86,7 +90,6 @@ def load_ohlcv(symbol: str, timeframe: str) -> list[dict]:
 
 def delete_latest_bar(symbol: str, timeframe: str):
     """Delete the most recent bar (potentially incomplete candle)."""
-    init_db()
     with get_connection() as conn:
         conn.execute(
             "DELETE FROM ohlcv WHERE symbol = ? AND timeframe = ? "
@@ -97,7 +100,6 @@ def delete_latest_bar(symbol: str, timeframe: str):
 
 def get_bar_count(symbol: str, timeframe: str) -> int:
     """Return number of cached bars."""
-    init_db()
     with get_connection() as conn:
         result = conn.execute(
             "SELECT COUNT(*) FROM ohlcv WHERE symbol = ? AND timeframe = ?",

@@ -2,17 +2,28 @@ import concurrent.futures
 import logging
 import threading
 import time
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.db import delete_latest_bar, get_bar_count, load_ohlcv, save_ohlcv
-from app.tv_fetch import TradingViewError, fetch_bars
+from app.db import db_ping, delete_latest_bar, get_bar_count, init_db, load_ohlcv, save_ohlcv
+from app.tv_fetch import TV_TOKEN, TradingViewError, fetch_bars
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Prices Service")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not TV_TOKEN:
+        raise RuntimeError(
+            "TV_TOKEN env var is empty; set it in .env before starting the service"
+        )
+    init_db()
+    yield
+
+
+app = FastAPI(title="Prices Service", lifespan=lifespan)
 
 VALID_TIMEFRAMES = {"1", "5", "15", "30", "1H", "1D", "1W", "1M"}
 
@@ -65,7 +76,7 @@ def healthz():
     db_error = None
 
     try:
-        get_bar_count("__healthcheck__", "1D")
+        db_ping()
     except Exception as exc:
         db_ok = False
         db_error = str(exc)

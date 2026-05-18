@@ -12,11 +12,11 @@ Ranked by impact.
 ## Medium
 
 5. **Fragile parser.** `parse_ohlcv_data` regexes raw websocket frames. If TV tweaks the format (commit `254b8e7` shows this has happened), it silently returns `[]` → looks like "no data." Add a sanity check (e.g. if the message contains `timescale_update` but parser yields zero rows, log loudly and raise).
-6. **`/healthz` does table-creation work.** `get_bar_count` → `init_db()` runs `CREATE TABLE IF NOT EXISTS` on every health check. Move init to startup (FastAPI lifespan), make healthz a cheap `SELECT 1`.
-7. **Fail fast on empty `TV_TOKEN`.** Currently accepted silently; fetches will hit TV without auth.
-8. **Hardcoded `BASE_DIR` in uncommitted `db.py` change.** Likely a launchd cwd workaround but it breaks the repo on any other machine. Better: set `WorkingDirectory` in the plist, or read `PRICES_DATA_DIR` from env with that as default.
+6. **[done] `/healthz` cheap.** Init moved into a FastAPI `lifespan` startup hook; `/healthz` now calls a new `db_ping()` (`SELECT 1`) instead of `get_bar_count`. Health checks no longer run any DDL.
+7. **[done] Fail fast on empty `TV_TOKEN`.** Lifespan startup raises `RuntimeError` if the token is empty so the service refuses to come up instead of silently making unauthenticated TV fetches.
+8. **[partly addressed] Hardcoded `BASE_DIR`.** Pin landed (commit `83d1318`) so launchd works; the cleaner fix (`WorkingDirectory` in the plist, or `PRICES_DATA_DIR` env var) is still open.
 
 ## Low
 
 9. **Structured logs / metrics** on fetch latency, success rate, stale-fallback rate → can't see degradation until it's bad.
-10. **`init_db()` runs on every DB call.** Cheap but unnecessary; move to startup.
+10. **[done] `init_db()` no longer runs on every DB call.** Per-function `init_db()` calls removed in favor of the single lifespan startup call (subsumed by #6).
