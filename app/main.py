@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 from contextlib import suppress
 
@@ -19,6 +20,19 @@ TV_TIMEFRAME_MAP = {"1H": "60"}
 
 _START_TIME = time.time()
 _BATCH_FETCH_DELAY_SECONDS = 0.5
+
+_symbol_locks: dict[tuple[str, str], threading.Lock] = {}
+_symbol_locks_meta = threading.Lock()
+
+
+def _get_symbol_lock(symbol: str, timeframe: str) -> threading.Lock:
+    key = (symbol, timeframe)
+    with _symbol_locks_meta:
+        lock = _symbol_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _symbol_locks[key] = lock
+        return lock
 
 
 class BatchBarsRequest(BaseModel):
@@ -89,55 +103,56 @@ def _build_stale_payload(symbol: str, timeframe: str, bars: int, warning: str) -
 def _get_bars_payload(symbol: str, timeframe: str, bars: int) -> dict:
     tv_freq = _validate_timeframe(timeframe)
 
-    try:
-        with suppress(Exception):
-            delete_latest_bar(symbol, timeframe)
-
-        cached_count = get_bar_count(symbol, timeframe)
-        all_bars = load_ohlcv(symbol, timeframe)
-
+    with _get_symbol_lock(symbol, timeframe):
         try:
-            if cached_count < bars - 1:
-                data = fetch_bars(symbol, tv_freq, bars=bars)
-                if not data:
-                    raise TradingViewError("No data received from TradingView")
+            with suppress(Exception):
+                delete_latest_bar(symbol, timeframe)
 
-                if len(data) > 1:
-                    save_ohlcv(symbol, timeframe, data[:-1])
-                    all_bars = load_ohlcv(symbol, timeframe)
+            cached_count = get_bar_count(symbol, timeframe)
+            all_bars = load_ohlcv(symbol, timeframe)
 
-                all_bars.append(_bar_from_row(data[-1]))
-            else:
-                data = fetch_bars(symbol, tv_freq, bars=min(10, bars))
-                if data:
+            try:
+                if cached_count < bars - 1:
+                    data = fetch_bars(symbol, tv_freq, bars=bars)
+                    if not data:
+                        raise TradingViewError("No data received from TradingView")
+
                     if len(data) > 1:
                         save_ohlcv(symbol, timeframe, data[:-1])
                         all_bars = load_ohlcv(symbol, timeframe)
+
                     all_bars.append(_bar_from_row(data[-1]))
-        except (TradingViewError, HTTPException) as exc:
-            warning = exc.detail if isinstance(exc, HTTPException) else str(exc)
-            logger.warning("TradingView fetch failed for %s %s: %s", symbol, timeframe, warning)
-            stale_payload = _build_stale_payload(symbol, timeframe, bars, warning)
-            if stale_payload is not None:
-                return stale_payload
-            if isinstance(exc, HTTPException):
-                raise
-            raise HTTPException(502, warning) from exc
+                else:
+                    data = fetch_bars(symbol, tv_freq, bars=min(10, bars))
+                    if data:
+                        if len(data) > 1:
+                            save_ohlcv(symbol, timeframe, data[:-1])
+                            all_bars = load_ohlcv(symbol, timeframe)
+                        all_bars.append(_bar_from_row(data[-1]))
+            except (TradingViewError, HTTPException) as exc:
+                warning = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                logger.warning("TradingView fetch failed for %s %s: %s", symbol, timeframe, warning)
+                stale_payload = _build_stale_payload(symbol, timeframe, bars, warning)
+                if stale_payload is not None:
+                    return stale_payload
+                if isinstance(exc, HTTPException):
+                    raise
+                raise HTTPException(502, warning) from exc
 
-        if len(all_bars) > bars:
-            all_bars = all_bars[-bars:]
+            if len(all_bars) > bars:
+                all_bars = all_bars[-bars:]
 
-        return {
-            "symbol": symbol,
-            "timeframe": timeframe,
-            "count": len(all_bars),
-            "bars": all_bars,
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("Unexpected prices-service failure for %s %s", symbol, timeframe)
-        raise HTTPException(500, f"Internal prices-service error: {exc}") from exc
+            return {
+                "symbol": symbol,
+                "timeframe": timeframe,
+                "count": len(all_bars),
+                "bars": all_bars,
+            }
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.exception("Unexpected prices-service failure for %s %s", symbol, timeframe)
+            raise HTTPException(500, f"Internal prices-service error: {exc}") from exc
 
 
 @app.get("/bars")

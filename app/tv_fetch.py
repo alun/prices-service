@@ -1,15 +1,21 @@
 import json
+import logging
 import os
 import random
 import re
 import string
+import time
 
 from dotenv import load_dotenv
 from websocket import create_connection
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
 TV_TOKEN = os.environ.get("TV_TOKEN", "")
+_MAX_FETCH_ATTEMPTS = 3
+_FETCH_RETRY_BASE_DELAY = 0.5
 
 
 class TradingViewError(Exception):
@@ -65,63 +71,68 @@ def parse_ohlcv_data(raw_data):
     return all_data
 
 
-def fetch_bars(symbol_name: str, frequency: str, bars: int = 5000) -> list:
-    """
-    Fetch OHLCV data from TradingView via WebSocket.
-
-    Returns list of [timestamp, open, high, low, close, volume].
-    """
+def _fetch_bars_once(symbol_name: str, frequency: str, bars: int) -> list:
+    """Single websocket attempt. Raises TradingViewError on connection/protocol failure."""
     headers = json.dumps({"Origin": "https://data.tradingview.com"})
-    ws = create_connection(
-        "wss://data.tradingview.com/socket.io/websocket", headers=headers,
-        timeout=15
-    )
+    ws = None
+    all_messages: list[str] = []
+    try:
+        ws = create_connection(
+            "wss://data.tradingview.com/socket.io/websocket",
+            headers=headers,
+            timeout=15,
+        )
 
-    session = generateSession()
-    chart_session = generateChartSession()
+        session = generateSession()
+        chart_session = generateChartSession()
 
-    sendMessage(ws, "set_auth_token", [TV_TOKEN])
-    sendMessage(ws, "chart_create_session", [chart_session, ""])
-    sendMessage(ws, "quote_create_session", [session])
+        sendMessage(ws, "set_auth_token", [TV_TOKEN])
+        sendMessage(ws, "chart_create_session", [chart_session, ""])
+        sendMessage(ws, "quote_create_session", [session])
 
-    sendMessage(
-        ws,
-        "resolve_symbol",
-        [
-            chart_session,
-            "sds_sym_1",
-            '={"symbol":"' + symbol_name + '","adjustment":"splits","session":"extended"}',
-        ],
-    )
+        sendMessage(
+            ws,
+            "resolve_symbol",
+            [
+                chart_session,
+                "sds_sym_1",
+                '={"symbol":"' + symbol_name + '","adjustment":"splits","session":"extended"}',
+            ],
+        )
 
-    sendMessage(
-        ws, "create_series", [chart_session, "sds_1", "s1", "sds_sym_1", frequency, bars]
-    )
+        sendMessage(
+            ws, "create_series", [chart_session, "sds_1", "s1", "sds_sym_1", frequency, bars]
+        )
 
-    sendMessage(ws, "quote_hibernate_all", [session])
+        sendMessage(ws, "quote_hibernate_all", [session])
 
-    import time
-    deadline = time.time() + 20  # hard limit 20 seconds total
-    all_messages = []
+        deadline = time.time() + 20  # hard limit 20 seconds total
+        while True:
+            try:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                ws.settimeout(remaining)
+                result = ws.recv()
+                all_messages.append(result)
 
-    while True:
-        try:
-            remaining = deadline - time.time()
-            if remaining <= 0:
+                if re.match(r"~m~\\d+~m~~h~\\d+$", result):
+                    ws.send(result)
+
+                if '"m":"timescale_update"' in result:
+                    break
+            except Exception:
                 break
-            ws.settimeout(remaining)
-            result = ws.recv()
-            all_messages.append(result)
-
-            if re.match(r"~m~\\d+~m~~h~\\d+$", result):
-                ws.send(result)
-
-            if '"m":"timescale_update"' in result:
-                break
-        except Exception:
-            break
-
-    ws.close()
+    except TradingViewError:
+        raise
+    except Exception as exc:
+        raise TradingViewError(f"TradingView websocket error: {exc}") from exc
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     combined = "".join(all_messages)
     all_data = parse_ohlcv_data(combined)
@@ -138,3 +149,34 @@ def fetch_bars(symbol_name: str, frequency: str, bars: int = 5000) -> list:
         all_data = unique_data
 
     return all_data
+
+
+def fetch_bars(symbol_name: str, frequency: str, bars: int = 5000) -> list:
+    """
+    Fetch OHLCV data from TradingView via WebSocket with retry on transient failures.
+
+    Returns list of [timestamp, open, high, low, close, volume].
+    Raises TradingViewError if all attempts fail with connection/protocol errors.
+    Returns [] if all attempts return empty (e.g. unknown symbol).
+    """
+    last_error: TradingViewError | None = None
+    for attempt in range(_MAX_FETCH_ATTEMPTS):
+        try:
+            data = _fetch_bars_once(symbol_name, frequency, bars)
+            if data:
+                return data
+            last_error = None
+        except TradingViewError as exc:
+            last_error = exc
+            logger.warning(
+                "TradingView fetch attempt %d/%d failed for %s: %s",
+                attempt + 1, _MAX_FETCH_ATTEMPTS, symbol_name, exc,
+            )
+
+        if attempt < _MAX_FETCH_ATTEMPTS - 1:
+            delay = _FETCH_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.25)
+            time.sleep(delay)
+
+    if last_error is not None:
+        raise last_error
+    return []
