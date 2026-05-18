@@ -155,17 +155,16 @@ def fetch_bars(symbol_name: str, frequency: str, bars: int = 5000) -> list:
     """
     Fetch OHLCV data from TradingView via WebSocket with retry on transient failures.
 
-    Returns list of [timestamp, open, high, low, close, volume].
-    Raises TradingViewError if all attempts fail with connection/protocol errors.
-    Returns [] if all attempts return empty (e.g. unknown symbol).
+    Returns list of [timestamp, open, high, low, close, volume]. May be empty
+    when TradingView has no data for the symbol — retrying does not help and
+    would just multiply the per-attempt deadline, so empty results are returned
+    immediately. Raises TradingViewError after exhausting retries on
+    connection/protocol errors.
     """
     last_error: TradingViewError | None = None
     for attempt in range(_MAX_FETCH_ATTEMPTS):
         try:
-            data = _fetch_bars_once(symbol_name, frequency, bars)
-            if data:
-                return data
-            last_error = None
+            return _fetch_bars_once(symbol_name, frequency, bars)
         except TradingViewError as exc:
             last_error = exc
             logger.warning(
@@ -177,6 +176,5 @@ def fetch_bars(symbol_name: str, frequency: str, bars: int = 5000) -> list:
             delay = _FETCH_RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.25)
             time.sleep(delay)
 
-    if last_error is not None:
-        raise last_error
-    return []
+    assert last_error is not None
+    raise last_error
