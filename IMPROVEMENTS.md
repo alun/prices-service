@@ -1,11 +1,11 @@
 # Prices Service — Stability Improvements
 
-Ranked by impact. Items 1 and 2 are being implemented now; the rest are open.
+Ranked by impact.
 
 ## High impact
 
-1. **Retry TV fetch on transient failures.** `fetch_bars` makes one websocket attempt; any transient blip → 502 (or stale fallback if cache exists). Retry 2–3× with backoff would absorb most flakes.
-2. **Per-symbol dedup / lock.** Two concurrent requests for the same `(symbol, timeframe)` both `delete_latest_bar` and re-`save_ohlcv`, racing on writes and double-hitting TV. An in-process asyncio lock per key would dedupe.
+1. **[done — with regression to fix] Retry TV fetch on transient failures.** Shipped in commit `4d47822`: `_fetch_bars_once` raises `TradingViewError` on connection/protocol errors; `fetch_bars` wraps with up to 3 attempts and exponential backoff + jitter. **Regression discovered:** retrying on empty result too means an unknown symbol burns ~60s (3 × 20s deadline) and stalls any batch it's in. Fix: only retry on `TradingViewError`, not on empty result.
+2. **[done] Per-symbol dedup / lock.** Shipped in commit `4d47822`: in-process `threading.Lock` keyed by `(symbol, timeframe)` serializes concurrent fetches so they don't double-hit TV or race on delete/save. Verified with a 3-thread test.
 3. **Concurrent batch fetching with per-symbol timeout.** Batch endpoint is serial with a 0.5s sleep between symbols. For N symbols you wait `N × (fetch_time + 0.5s)`; one slow symbol stalls the whole batch. A bounded concurrent gather (e.g. 4-wide) plus a per-symbol timeout would cut latency *and* failure blast-radius.
 4. **Total request budget.** `fetch_bars` can sit ~20s; batches have no overall deadline. Clients can hang. Add `asyncio.wait_for` per symbol and a global cap per request.
 
