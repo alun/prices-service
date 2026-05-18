@@ -1,3 +1,4 @@
+import concurrent.futures
 import logging
 import threading
 import time
@@ -19,10 +20,16 @@ VALID_TIMEFRAMES = {"1", "5", "15", "30", "1H", "1D", "1W", "1M"}
 TV_TIMEFRAME_MAP = {"1H": "60"}
 
 _START_TIME = time.time()
-_BATCH_FETCH_DELAY_SECONDS = 0.5
+_BATCH_MAX_WORKERS = 4
+_BATCH_TOTAL_TIMEOUT_SECONDS = 45
 
 _symbol_locks: dict[tuple[str, str], threading.Lock] = {}
 _symbol_locks_meta = threading.Lock()
+
+_batch_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_BATCH_MAX_WORKERS,
+    thread_name_prefix="bars-batch",
+)
 
 
 def _get_symbol_lock(symbol: str, timeframe: str) -> threading.Lock:
@@ -181,6 +188,29 @@ def post_bars_batch(request: BatchBarsRequest):
     return _get_bars_batch_payload(request.symbols, request.timeframe, request.bars)
 
 
+def _process_one_symbol(symbol: str, timeframe: str, bars: int) -> dict:
+    try:
+        payload = _get_bars_payload(symbol=symbol, timeframe=timeframe, bars=bars)
+        payload["status"] = "ok"
+        return payload
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+        return {
+            "symbol": symbol,
+            "status": "error",
+            "error": detail,
+            "http_status": exc.status_code,
+        }
+    except Exception as exc:
+        logger.exception("Unexpected batch failure for %s %s", symbol, timeframe)
+        return {
+            "symbol": symbol,
+            "status": "error",
+            "error": f"Internal prices-service error: {exc}",
+            "http_status": 500,
+        }
+
+
 def _get_bars_batch_payload(symbols: list[str], timeframe: str, bars: int) -> dict:
     _validate_timeframe(timeframe)
 
@@ -188,42 +218,46 @@ def _get_bars_batch_payload(symbols: list[str], timeframe: str, bars: int) -> di
     if not normalized_symbols:
         raise HTTPException(400, "At least one symbol is required")
 
-    results = []
-    succeeded = 0
+    results: dict[int, dict] = {}
+    deadline = time.monotonic() + _BATCH_TOTAL_TIMEOUT_SECONDS
 
-    for index, symbol in enumerate(normalized_symbols):
-        try:
-            payload = _get_bars_payload(symbol=symbol, timeframe=timeframe, bars=bars)
-            payload["status"] = "ok"
-            results.append(payload)
-            succeeded += 1
-        except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-            results.append(
+    future_to_index = {
+        _batch_executor.submit(_process_one_symbol, symbol, timeframe, bars): idx
+        for idx, symbol in enumerate(normalized_symbols)
+    }
+    try:
+        for future in concurrent.futures.as_completed(
+            future_to_index, timeout=_BATCH_TOTAL_TIMEOUT_SECONDS
+        ):
+            results[future_to_index[future]] = future.result()
+            if time.monotonic() >= deadline:
+                break
+    except concurrent.futures.TimeoutError:
+        pass
+    finally:
+        for future in future_to_index:
+            if not future.done():
+                future.cancel()
+
+    ordered_results = []
+    for idx, symbol in enumerate(normalized_symbols):
+        if idx in results:
+            ordered_results.append(results[idx])
+        else:
+            ordered_results.append(
                 {
                     "symbol": symbol,
                     "status": "error",
-                    "error": detail,
-                    "http_status": exc.status_code,
-                }
-            )
-        except Exception as exc:
-            logger.exception("Unexpected batch failure for %s %s", symbol, timeframe)
-            results.append(
-                {
-                    "symbol": symbol,
-                    "status": "error",
-                    "error": f"Internal prices-service error: {exc}",
-                    "http_status": 500,
+                    "error": f"Timed out after {_BATCH_TOTAL_TIMEOUT_SECONDS}s batch budget",
+                    "http_status": 504,
                 }
             )
 
-        if index < len(normalized_symbols) - 1:
-            time.sleep(_BATCH_FETCH_DELAY_SECONDS)
+    succeeded = sum(1 for r in ordered_results if r.get("status") == "ok")
+    failed = len(ordered_results) - succeeded
 
-    failed = len(results) - succeeded
     return {
-        "results": results,
+        "results": ordered_results,
         "total": len(normalized_symbols),
         "succeeded": succeeded,
         "failed": failed,

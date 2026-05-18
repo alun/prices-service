@@ -6,8 +6,8 @@ Ranked by impact.
 
 1. **[done] Retry TV fetch on transient failures.** Shipped in commit `4d47822`: `_fetch_bars_once` raises `TradingViewError` on connection/protocol errors; `fetch_bars` wraps with up to 3 attempts and exponential backoff + jitter. Initial version also retried on empty results, which made an unknown symbol burn ~60s and stall any batch it was in — fixed in a follow-up commit so empty results return immediately (TV genuinely has no data; retrying doesn't help). Verified: batch with one bogus symbol now completes in ~22s with a per-symbol 502 instead of timing out.
 2. **[done] Per-symbol dedup / lock.** Shipped in commit `4d47822`: in-process `threading.Lock` keyed by `(symbol, timeframe)` serializes concurrent fetches so they don't double-hit TV or race on delete/save. Verified with a 3-thread test.
-3. **Concurrent batch fetching with per-symbol timeout.** Batch endpoint is serial with a 0.5s sleep between symbols. For N symbols you wait `N × (fetch_time + 0.5s)`; one slow symbol stalls the whole batch. A bounded concurrent gather (e.g. 4-wide) plus a per-symbol timeout would cut latency *and* failure blast-radius.
-4. **Total request budget.** `fetch_bars` can sit ~20s; batches have no overall deadline. Clients can hang. Add `asyncio.wait_for` per symbol and a global cap per request.
+3. **[done] Concurrent batch fetching.** Batch endpoint now uses a module-level `ThreadPoolExecutor(max_workers=4)`; the 0.5s inter-symbol sleep is gone (concurrency cap is the rate limit). Result order matches input order. Verified: 3 cache-warm symbols 2.5s → 1.5s; one bogus symbol mixed with valid ones 60s+ timeout → 21s.
+4. **[done] Total request budget.** Batch wraps `concurrent.futures.as_completed` with a 45s total deadline; any unfinished symbols return a per-symbol 504 with a `Timed out after 45s batch budget` error so the request never hangs indefinitely.
 
 ## Medium
 
